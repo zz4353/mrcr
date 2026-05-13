@@ -109,6 +109,8 @@ def main() -> None:
     desired_msg_index = []
     target_relative_position = []
     token_counts = []
+    overall_roles = Counter()
+    roles_per_sample: dict[str, list[int]] = {}
     row_count = 0
 
     for row in iter_rows(args.path, args.max_rows):
@@ -125,6 +127,12 @@ def main() -> None:
         if encoder is not None:
             token_counts.append(count_tokens(row, encoder))
 
+        if "messages" in row:
+            role_counts = Counter(message.get("role", "<missing>") for message in row["messages"])
+            overall_roles.update(role_counts)
+            for role, count in role_counts.items():
+                roles_per_sample.setdefault(role, []).append(count)
+
     print(f"File: {args.path}")
     print(f"Rows: {row_count}")
     print()
@@ -132,6 +140,15 @@ def main() -> None:
     print("n_needles distribution:")
     print(format_distribution(n_needles))
     print()
+
+    if overall_roles:
+        print("role distribution overall:")
+        print(format_distribution(overall_roles))
+        print()
+
+        for role in sorted(roles_per_sample):
+            print(format_numeric_stats(f"{role} messages per sample", roles_per_sample[role]))
+            print()
 
     print(format_numeric_stats("context length in characters (n_chars)", n_chars))
     print()
