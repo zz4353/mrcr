@@ -1,8 +1,8 @@
 """Run MRCR mini evaluation with optional image-history conversion.
 
 Examples:
-    python eval_mini_mrcr.py --split val --model gpt-4.1
-    python eval_mini_mrcr.py --split test --mode image-history --model gpt-4.1
+    python eval_mini_mrcr.py --split val --model gpt-5
+    python eval_mini_mrcr.py --split test --mode image-history --model gpt-5
     python eval_mini_mrcr.py --grade-only runs/mrcr_val_text.jsonl
 """
 
@@ -23,6 +23,7 @@ from mrcr_image_history import ConversationImageRenderer, build_image_history_me
 
 DEFAULT_DATA_DIR = Path("data") / "mini"
 DEFAULT_OUTPUT_DIR = Path("runs")
+DEFAULT_ENV_FILE = Path(".env")
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,7 +33,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--mode", choices=("text", "image-history"), default="text")
     parser.add_argument("--recent-turns", type=int, default=3)
-    parser.add_argument("--model", default="gpt-4.1")
+    parser.add_argument("--model", default="gpt-5")
+    parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--max-completion-tokens", type=int, default=None)
@@ -43,6 +45,24 @@ def parse_args() -> argparse.Namespace:
         help="Skip model calls and summarize an existing JSONL output file.",
     )
     return parser.parse_args()
+
+
+def load_env_file(path: Path) -> None:
+    """Load KEY=VALUE pairs from a local .env without overriding existing env vars."""
+    if not path.exists():
+        return
+
+    with path.open("r", encoding="utf-8") as file:
+        for raw_line in file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -147,8 +167,10 @@ def summarize(path: Path) -> None:
 
 
 def run_eval(args: argparse.Namespace) -> Path:
+    load_env_file(args.env_file)
+
     if not os.getenv("OPENAI_API_KEY"):
-        raise SystemExit("Set OPENAI_API_KEY before running model evaluation.")
+        raise SystemExit("Set OPENAI_API_KEY or add it to .env before running model evaluation.")
 
     data_path = args.data_dir / f"{args.split}.jsonl"
     rows = read_jsonl(data_path)
