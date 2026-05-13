@@ -7,8 +7,8 @@ from collections import Counter
 from pathlib import Path
 
 
-VAL_PATH = Path("data") / "mrcr" / "mini" / "val.jsonl"
-TEST_PATH = Path("data") / "mrcr" / "mini" / "test.jsonl"
+VAL_PATH = Path("data") / "mini" / "val.jsonl"
+TEST_PATH = Path("data") / "mini" / "test.jsonl"
 
 TOKEN_BINS = {
     "4k-8k": (4_096, 8_192),

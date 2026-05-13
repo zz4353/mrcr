@@ -1,2 +1,5 @@
 .env
 data/mrcr/
+runs/
+debug_first_val_image_history/
+pycache/
