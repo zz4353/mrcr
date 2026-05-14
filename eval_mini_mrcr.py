@@ -1,8 +1,8 @@
 """Run MRCR mini evaluation with optional image-history conversion.
 
 Examples:
-    python eval_mini_mrcr.py --split val --model gpt-5
-    python eval_mini_mrcr.py --split test --mode image-history --model gpt-5
+    python eval_mini_mrcr.py --split val --model gpt-5.4
+    python eval_mini_mrcr.py --split test --mode image-history --model gpt-5.4
     python eval_mini_mrcr.py --grade-only runs/mrcr_val_text.jsonl
 """
 
@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--mode", choices=("text", "image-history"), default="text")
     parser.add_argument("--recent-turns", type=int, default=3)
-    parser.add_argument("--model", default="gpt-5")
+    parser.add_argument("--model", default="gpt-5.4")
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--resume", action="store_true")

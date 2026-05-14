@@ -9,8 +9,10 @@ from .renderer import ConversationImageRenderer
 
 RECENT_TEXT_TURNS = 3
 IMAGE_HISTORY_PROMPT = (
-    "Older conversation history is provided as images below. "
-    "Read them as prior chat context, then continue from the recent text messages."
+    "The user's earlier conversation history is important context for this chat, but it could not be sent directly as text. "
+    "It has therefore been captured in the images below, shown in chronological order. "
+    "Each red number marks a chat message, and the numbering continues across images. "
+    "Read these numbered images as the older part of the same conversation, then continue from the recent text messages that follow."
 )
 
 

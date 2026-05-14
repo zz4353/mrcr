@@ -23,6 +23,7 @@ ROLE_LABELS = {
     "human": "User",
     "assistant": "Assistant",
     "ai": "Assistant",
+    "agent": "Assistant",
     "tool": "Tool result",
     "system": "System",
 }
@@ -442,20 +443,6 @@ class ConversationImageRenderer:
         return False
 
     def _compact_short_multiline_text(self, text: str, chars_per_line: int) -> str:
-        raw_lines = text.expandtabs(4).splitlines()
-        non_empty = [line.strip() for line in raw_lines if line.strip()]
-
-        if len(non_empty) <= 1:
-            return text
-        if self._looks_structured_or_code(raw_lines):
-            return "\n".join(line.rstrip() for line in raw_lines if line.strip())
-
-        longest_line = max(len(line) for line in non_empty)
-        joined = " | ".join(non_empty)
-        compact_limit = chars_per_line * 3
-
-        if longest_line <= chars_per_line and len(joined) <= compact_limit:
-            return joined
         return text
 
     def _wrap_numbered_text(

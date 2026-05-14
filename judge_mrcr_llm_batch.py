@@ -1,9 +1,9 @@
-r"""LLM-judge MRCR graded results through the OpenAI Batch API.
+r"""LLM-judge MRCR batch outputs independently.
 
 Examples:
-    python judge_mrcr_llm_batch.py submit --graded results\mrcr_val_text_gpt-5_graded.json
-    python judge_mrcr_llm_batch.py retrieve --graded results\mrcr_val_text_gpt-5_graded.json
-    python judge_mrcr_llm_batch.py report --graded results\mrcr_val_text_gpt-5_graded.json
+    python judge_mrcr_llm_batch.py submit --manifest results\mrcr_val_text_gpt-5.4_manifest.jsonl --batch-output results\mrcr_val_text_gpt-5.4_batch_output.jsonl
+    python judge_mrcr_llm_batch.py retrieve --manifest results\mrcr_val_text_gpt-5.4_manifest.jsonl --batch-output results\mrcr_val_text_gpt-5.4_batch_output.jsonl
+    python judge_mrcr_llm_batch.py report --manifest results\mrcr_val_text_gpt-5.4_manifest.jsonl --batch-output results\mrcr_val_text_gpt-5.4_batch_output.jsonl
 """
 
 from __future__ import annotations
@@ -19,38 +19,30 @@ from openai import OpenAI
 
 
 DEFAULT_ENV_FILE = Path(".env")
-DEFAULT_JUDGE_MODEL = "gpt-5"
+DEFAULT_JUDGE_MODEL = "gpt-5.4"
 ENDPOINT = "/v1/chat/completions"
 
-SYSTEM_PROMPT = """You are a strict judge for a long-context retrieval benchmark.
+SYSTEM_PROMPT = """You are a fair judge for a long-context memory benchmark.
 
-Task: decide whether model_response successfully retrieved the same prior conversation content as expected_answer.
+Judge whether model_response remembered the same prior assistant answer as expected_answer.
 
-Important: this is NOT a general semantic similarity task. The model is supposed to recover a specific previous answer, not write a new answer on the same topic.
+This is not an exact transcription test. Accept paraphrases and wording changes if the response is clearly the same item and keeps the main topic, purpose, structure, and key details.
 
-Correctness standard:
-- Mark correct=true only if model_response preserves the same concrete content as expected_answer.
-- The required prefix at the start must be present. If metadata.prefix_ok is false, mark correct=false with error_type="missing_prefix".
-- Ignore only harmless surface differences: whitespace, line breaks, quote style, markdown emphasis style, minor punctuation, and very small formatting changes.
-- Minor wording changes are acceptable only when they do not change meaning, omit important content, add important content, or make the answer look newly generated.
+Mark correct=true for:
+- Same item with similar meaning, even if wording, formatting, emojis, markdown, or closing lines differ.
+- Same article/email/post/poem/scene with minor omissions or small rewritten parts.
 
-Mark correct=false for any of these:
-- wrong_needle: response is a different item/needle, even if topic, genre, or opening words are similar.
-- partial: response omits meaningful content such as a title, section, stanza, paragraph, list item, CTA, signature, conclusion, examples, or key details.
-- extra_content: response adds substantial new content not present in expected_answer, including new paragraphs, new claims, new hashtags, new CTA, new signature, or new examples.
-- paraphrase_too_loose: response is materially rewritten, compressed, expanded, translated, or newly generated instead of faithfully retrieved.
-- refusal: response refuses, asks for clarification, says it cannot find the item, or gives meta-commentary instead of the answer.
-- empty: response is empty or nearly empty.
-- other: response fails for another reason.
+Mark correct=false for:
+- wrong_needle: a different prior item, even if the topic is similar.
+- partial: only a small part is remembered, or major sections are missing.
+- extra_content: new content changes the purpose or identity of the item.
+- paraphrase_too_loose: rewritten so heavily that it no longer feels like the same item.
+- missing_prefix: required prefix is missing or not at the beginning.
+- refusal, empty, or other clear failure.
 
-Length/completeness guidance:
-- A much shorter response is usually partial unless expected_answer itself is short.
-- A much longer response is usually extra_content unless the extra text is only trivial formatting.
-- If the beginning matches but the ending is missing, mark partial.
-- If the structure/order differs in a meaningful way, mark false.
-- If only emojis, bullets, blank lines, markdown markers, or apostrophe/quote style differ, mark correct=true.
+When uncertain between correct and false, prefer correct if the same remembered item is recognizable.
 
-Return only JSON with:
+Return only JSON:
 {
   "correct": boolean,
   "confidence": number from 0 to 1,
@@ -61,12 +53,13 @@ Return only JSON with:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="LLM judge MRCR graded outputs with Batch API.")
+    parser = argparse.ArgumentParser(description="LLM judge MRCR batch outputs with Batch API.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     for command in ("create", "submit", "retrieve", "report"):
         subparser = subparsers.add_parser(command)
-        subparser.add_argument("--graded", type=Path, required=True)
+        subparser.add_argument("--manifest", type=Path, required=True)
+        subparser.add_argument("--batch-output", type=Path, required=True)
         subparser.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL)
         subparser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
 
@@ -103,13 +96,6 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as file:
-        for row in rows:
-            file.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as file:
@@ -119,33 +105,120 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as file:
+        for row in rows:
+            file.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def safe_model_name(model: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in model)
 
 
+def stem_from_batch_output(path: Path) -> str:
+    name = path.name
+    if name.endswith("_batch_output.jsonl"):
+        return name[: -len("_batch_output.jsonl")]
+    return path.stem
+
+
 def output_paths(args: argparse.Namespace) -> dict[str, Path]:
-    base = args.graded.with_suffix("")
-    suffix = f"_llm_judge_{safe_model_name(args.judge_model)}"
+    stem = stem_from_batch_output(args.batch_output)
+    base = args.batch_output.parent / f"{stem}_llm_judge_{safe_model_name(args.judge_model)}"
     return {
-        "batch_input": Path(f"{base}{suffix}_batch_input.jsonl"),
-        "batch": Path(f"{base}{suffix}_batch.json"),
-        "batch_output": Path(f"{base}{suffix}_batch_output.jsonl"),
-        "batch_errors": Path(f"{base}{suffix}_batch_errors.jsonl"),
-        "report": Path(f"{base}{suffix}_report.json"),
+        "batch_input": Path(f"{base}_batch_input.jsonl"),
+        "batch": Path(f"{base}_batch.json"),
+        "batch_output": Path(f"{base}_batch_output.jsonl"),
+        "batch_errors": Path(f"{base}_batch_errors.jsonl"),
+        "report": Path(f"{base}_report.json"),
     }
+
+
+def extract_response_text(batch_row: dict[str, Any] | None) -> str:
+    if not batch_row:
+        return ""
+    response = batch_row.get("response") or {}
+    body = response.get("body") or {}
+    choices = body.get("choices") or []
+    if not choices:
+        return ""
+
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+        return "".join(parts)
+    return ""
+
+
+def load_final_user_messages(split: str | None) -> dict[int, str]:
+    if not split:
+        return {}
+
+    data_path = Path("data") / "mini" / f"{split}.jsonl"
+    if not data_path.exists():
+        return {}
+
+    mapping: dict[int, str] = {}
+    with data_path.open("r", encoding="utf-8") as file:
+        for line in file:
+            if not line.strip():
+                continue
+            source_row = json.loads(line)
+            messages = source_row.get("messages") or []
+            final_user = ""
+            for message in reversed(messages):
+                if message.get("role") == "user":
+                    final_user = str(message.get("content", ""))
+                    break
+            source_index = source_row.get("mrcr_source_row_index")
+            if isinstance(source_index, int):
+                mapping[source_index] = final_user
+    return mapping
+
+
+def build_records(args: argparse.Namespace) -> list[dict[str, Any]]:
+    manifest_rows = read_jsonl(args.manifest)
+    batch_rows = {row["custom_id"]: row for row in read_jsonl(args.batch_output)}
+    split = manifest_rows[0].get("split") if manifest_rows else None
+    final_user_messages = load_final_user_messages(split)
+    records: list[dict[str, Any]] = []
+
+    for row in manifest_rows:
+        response_text = extract_response_text(batch_rows.get(row["custom_id"]))
+        records.append(
+            {
+                "custom_id": row["custom_id"],
+                "split": row.get("split"),
+                "mode": row.get("mode"),
+                "model": row.get("model"),
+                "row_index_in_split": row.get("row_index_in_split"),
+                "mrcr_source_row_index": row["mrcr_source_row_index"],
+                "n_needles": row.get("n_needles"),
+                "n_tokens_o200k": row.get("n_tokens_o200k"),
+                "token_bin_o200k": row.get("token_bin_o200k"),
+                "target_position_bin": row.get("target_position_bin"),
+                "random_string_to_prepend": row.get("random_string_to_prepend", ""),
+                "final_user_message": final_user_messages.get(row["mrcr_source_row_index"], ""),
+                "expected_answer": row.get("answer", ""),
+                "model_response": response_text,
+                "prefix_ok": response_text.startswith(row.get("random_string_to_prepend", "")),
+            }
+        )
+
+    return records
 
 
 def build_user_prompt(row: dict[str, Any]) -> str:
     return json.dumps(
         {
-            "metadata": {
-                "custom_id": row["custom_id"],
-                "n_needles": row.get("n_needles"),
-                "token_bin_o200k": row.get("token_bin_o200k"),
-                "target_position_bin": row.get("target_position_bin"),
-                "prefix_ok": row.get("prefix_ok"),
-                "sequence_matcher_score": row.get("score"),
-            },
+            "final_user_message": row.get("final_user_message", ""),
             "expected_answer": row.get("expected_answer", ""),
             "model_response": row.get("model_response", ""),
         },
@@ -154,10 +227,10 @@ def build_user_prompt(row: dict[str, Any]) -> str:
 
 
 def create_batch_file(args: argparse.Namespace) -> dict[str, Path]:
-    graded = read_json(args.graded)
+    records = build_records(args)
     requests: list[dict[str, Any]] = []
 
-    for row in graded["details"]:
+    for row in records:
         requests.append(
             {
                 "custom_id": f"judge-{row['custom_id']}",
@@ -230,7 +303,10 @@ def retrieve_batch(args: argparse.Namespace) -> None:
         print("No error_file_id.")
 
 
-def extract_judge_json(batch_row: dict[str, Any]) -> dict[str, Any]:
+def extract_judge_json(batch_row: dict[str, Any] | None) -> dict[str, Any]:
+    if not batch_row:
+        return {"correct": False, "confidence": 0, "error_type": "empty", "reason": "Missing judge output"}
+
     response = batch_row.get("response") or {}
     body = response.get("body") or {}
     choices = body.get("choices") or []
@@ -284,16 +360,15 @@ def build_report(args: argparse.Namespace) -> None:
     if not paths["batch_output"].exists():
         raise SystemExit(f"Missing judge output: {paths['batch_output']}. Run retrieve first.")
 
-    graded = read_json(args.graded)
-    graded_by_custom_id = {f"judge-{row['custom_id']}": row for row in graded["details"]}
+    records = {f"judge-{row['custom_id']}": row for row in build_records(args)}
     judge_rows = {row["custom_id"]: row for row in read_jsonl(paths["batch_output"])}
     details: list[dict[str, Any]] = []
 
     for judge_custom_id, original in sorted(
-        graded_by_custom_id.items(),
+        records.items(),
         key=lambda item: item[1]["row_index_in_split"],
     ):
-        judge = extract_judge_json(judge_rows.get(judge_custom_id, {}))
+        judge = extract_judge_json(judge_rows.get(judge_custom_id))
         details.append(
             {
                 "custom_id": original["custom_id"],
@@ -303,10 +378,9 @@ def build_report(args: argparse.Namespace) -> None:
                 "mode": original["mode"],
                 "model": original["model"],
                 "n_needles": original.get("n_needles"),
+                "n_tokens_o200k": original.get("n_tokens_o200k"),
                 "token_bin_o200k": original.get("token_bin_o200k"),
                 "target_position_bin": original.get("target_position_bin"),
-                "official_score": original["score"],
-                "official_correct": original["correct"],
                 "prefix_ok": original["prefix_ok"],
                 "llm_correct": bool(judge.get("correct")),
                 "llm_confidence": judge.get("confidence"),
@@ -316,7 +390,8 @@ def build_report(args: argparse.Namespace) -> None:
         )
 
     report = {
-        "graded": str(args.graded),
+        "manifest": str(args.manifest),
+        "batch_output": str(args.batch_output),
         "judge_model": args.judge_model,
         "summary": summarize(details),
         "details": details,

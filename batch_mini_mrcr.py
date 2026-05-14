@@ -1,8 +1,8 @@
 """Submit, retrieve, and download MRCR mini Batch API jobs.
 
 Examples:
-    python batch_mini_mrcr.py submit --split val --mode text --model gpt-5
-    python batch_mini_mrcr.py retrieve --split val --mode text --model gpt-5
+    python batch_mini_mrcr.py submit --split val --mode text --model gpt-5.4
+    python batch_mini_mrcr.py retrieve --split val --mode text --model gpt-5.4
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ DEFAULT_DATA_DIR = Path("data") / "mini"
 DEFAULT_RESULTS_DIR = Path("results")
 DEFAULT_ENV_FILE = Path(".env")
 ENDPOINT = "/v1/chat/completions"
+MAX_REQUESTS_PER_BATCH = 15
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,7 +49,12 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--mode", choices=("text", "image-history"), default="text")
     parser.add_argument("--recent-turns", type=int, default=3)
-    parser.add_argument("--model", default="gpt-5")
+    parser.add_argument("--model", default="gpt-5.4")
+    parser.add_argument(
+        "--only-parts",
+        default=None,
+        help="Comma-separated 1-based part numbers to create/submit again, e.g. 2,3.",
+    )
 
 
 def load_env_file(path: Path) -> None:
@@ -103,8 +109,7 @@ def stem_for(args: argparse.Namespace) -> str:
     return f"mrcr_{args.split}_{args.mode}_{safe_model_name(args.model)}"
 
 
-def output_paths(args: argparse.Namespace) -> dict[str, Path]:
-    stem = stem_for(args)
+def paths_for_stem(args: argparse.Namespace, stem: str) -> dict[str, Path]:
     return {
         "batch_input": args.results_dir / f"{stem}_batch_input.jsonl",
         "manifest": args.results_dir / f"{stem}_manifest.jsonl",
@@ -112,6 +117,49 @@ def output_paths(args: argparse.Namespace) -> dict[str, Path]:
         "batch_output": args.results_dir / f"{stem}_batch_output.jsonl",
         "batch_errors": args.results_dir / f"{stem}_batch_errors.jsonl",
     }
+
+
+def output_paths(args: argparse.Namespace) -> dict[str, Path]:
+    return paths_for_stem(args, stem_for(args))
+
+
+def part_output_paths(args: argparse.Namespace, part_index: int) -> dict[str, Path]:
+    return paths_for_stem(args, f"{stem_for(args)}_part{part_index:02d}")
+
+
+def selected_parts(args: argparse.Namespace) -> set[int] | None:
+    if not args.only_parts:
+        return None
+
+    parts: set[int] = set()
+    for raw_part in args.only_parts.split(","):
+        raw_part = raw_part.strip()
+        if not raw_part:
+            continue
+        try:
+            part = int(raw_part)
+        except ValueError as exc:
+            raise SystemExit(f"Invalid --only-parts value: {args.only_parts}") from exc
+        if part <= 0:
+            raise SystemExit("--only-parts uses 1-based positive part numbers.")
+        parts.add(part)
+
+    if not parts:
+        raise SystemExit(f"Invalid --only-parts value: {args.only_parts}")
+    return parts
+
+
+def cleanup_previous_generated_files(args: argparse.Namespace) -> None:
+    stem = stem_for(args)
+    for path in args.results_dir.glob(f"{stem}_part*"):
+        if path.is_file():
+            path.unlink()
+
+    paths = output_paths(args)
+    for key in ("batch_input", "batch_output", "batch_errors"):
+        path = paths[key]
+        if path.exists():
+            path.unlink()
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -135,13 +183,15 @@ def build_messages(
     )
 
 
-def build_batch_files(args: argparse.Namespace) -> dict[str, Path]:
-    rows = read_jsonl(args.data_dir / f"{args.split}.jsonl")
-    renderer = ConversationImageRenderer() if args.mode == "image-history" else None
+def build_request_rows(
+    args: argparse.Namespace,
+    indexed_rows: list[tuple[int, dict[str, Any]]],
+    renderer: ConversationImageRenderer | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     requests: list[dict[str, Any]] = []
     manifest: list[dict[str, Any]] = []
 
-    for index, row in enumerate(rows):
+    for index, row in indexed_rows:
         source_index = row["mrcr_source_row_index"]
         custom_id = f"mrcr-{args.split}-{args.mode}-row-{source_index}"
         body: dict[str, Any] = {
@@ -181,38 +231,149 @@ def build_batch_files(args: argparse.Namespace) -> dict[str, Path]:
             }
         )
 
+    return requests, manifest
+
+
+def split_chunks(items: list[Any], chunk_size: int) -> list[list[Any]]:
+    return [items[index : index + chunk_size] for index in range(0, len(items), chunk_size)]
+
+
+def build_batch_files(args: argparse.Namespace) -> dict[str, Path]:
+    selected = selected_parts(args)
+    if selected is None:
+        cleanup_previous_generated_files(args)
+
+    rows = read_jsonl(args.data_dir / f"{args.split}.jsonl")
+    indexed_rows = list(enumerate(rows))
+    renderer = ConversationImageRenderer() if args.mode == "image-history" else None
     paths = output_paths(args)
-    write_jsonl(paths["batch_input"], requests)
-    write_jsonl(paths["manifest"], manifest)
-    print(f"Wrote {len(requests)} requests: {paths['batch_input']}")
-    print(f"Wrote manifest: {paths['manifest']}")
+
+    if len(indexed_rows) <= MAX_REQUESTS_PER_BATCH:
+        if selected is not None:
+            raise SystemExit("--only-parts can only be used when the dataset is split into multiple parts.")
+        requests, manifest = build_request_rows(args, indexed_rows, renderer)
+        write_jsonl(paths["batch_input"], requests)
+        write_jsonl(paths["manifest"], manifest)
+        print(f"Wrote {len(requests)} requests: {paths['batch_input']}")
+        print(f"Wrote manifest: {paths['manifest']}")
+        return paths
+
+    all_manifest: list[dict[str, Any]] = []
+    chunks = split_chunks(indexed_rows, MAX_REQUESTS_PER_BATCH)
+    unknown_parts = selected - set(range(1, len(chunks) + 1)) if selected is not None else set()
+    if unknown_parts:
+        unknown = ", ".join(str(part) for part in sorted(unknown_parts))
+        raise SystemExit(f"Unknown part(s): {unknown}. This run has {len(chunks)} parts.")
+
+    for part_index, chunk in enumerate(chunks, 1):
+        if selected is not None and part_index not in selected:
+            continue
+
+        requests, manifest = build_request_rows(args, chunk, renderer)
+        part_paths = part_output_paths(args, part_index)
+        write_jsonl(part_paths["batch_input"], requests)
+        write_jsonl(part_paths["manifest"], manifest)
+        all_manifest.extend(manifest)
+        print(
+            f"Wrote part {part_index}/{len(chunks)} rows "
+            f"{chunk[0][0] + 1}-{chunk[-1][0] + 1}: {part_paths['batch_input']}"
+        )
+
+    if selected is None or not paths["manifest"].exists():
+        full_manifest: list[dict[str, Any]] = []
+        for chunk in chunks:
+            _, manifest = build_request_rows(args, chunk, renderer)
+            full_manifest.extend(manifest)
+        write_jsonl(paths["manifest"], full_manifest)
+        print(f"Wrote combined manifest: {paths['manifest']}")
+
     return paths
 
 
 def submit_batch(args: argparse.Namespace) -> None:
     require_api_key(args.env_file)
-    paths = build_batch_files(args)
+    build_batch_files(args)
+    paths = output_paths(args)
     client = OpenAI()
 
-    with paths["batch_input"].open("rb") as file:
-        uploaded_file = client.files.create(file=file, purpose="batch")
+    selected = selected_parts(args)
+    part_inputs = sorted(args.results_dir.glob(f"{stem_for(args)}_part*_batch_input.jsonl"))
+    if selected is not None:
+        part_inputs = [
+            path
+            for path in part_inputs
+            if int(path.name.split("_part", 1)[1].split("_", 1)[0]) in selected
+        ]
 
-    batch = client.batches.create(
-        input_file_id=uploaded_file.id,
-        endpoint=ENDPOINT,
-        completion_window="24h",
-        metadata={
-            "task": "mrcr-mini",
-            "split": args.split,
-            "mode": args.mode,
-            "model": args.model,
-        },
-    )
-    batch_data = batch.model_dump(mode="json")
-    write_json(paths["batch"], batch_data)
-    print(f"Uploaded file: {uploaded_file.id}")
-    print(f"Created batch: {batch.id}")
-    print(f"Wrote batch metadata: {paths['batch']}")
+    if not part_inputs:
+        part_inputs = [paths["batch_input"]]
+
+    existing_metadata = read_json(paths["batch"]) if paths["batch"].exists() else {}
+    existing_parts_by_number: dict[int, dict[str, Any]] = {}
+    if existing_metadata.get("multi_batch"):
+        existing_parts_by_number = {
+            int(part["part"]): part for part in existing_metadata.get("parts", [])
+        }
+
+    batch_parts: list[dict[str, Any]] = []
+    total_parts = len(split_chunks(read_jsonl(args.data_dir / f"{args.split}.jsonl"), MAX_REQUESTS_PER_BATCH))
+
+    for batch_input_path in part_inputs:
+        if "_part" in batch_input_path.name:
+            part_number = int(batch_input_path.name.split("_part", 1)[1].split("_", 1)[0])
+            part_paths = part_output_paths(args, part_number)
+        else:
+            part_number = 1
+            part_paths = paths
+
+        with batch_input_path.open("rb") as file:
+            uploaded_file = client.files.create(file=file, purpose="batch")
+
+        batch = client.batches.create(
+            input_file_id=uploaded_file.id,
+            endpoint=ENDPOINT,
+            completion_window="24h",
+            metadata={
+                "task": "mrcr-mini",
+                "split": args.split,
+                "mode": args.mode,
+                "model": args.model,
+                "part": str(part_number),
+                "parts": str(total_parts),
+            },
+        )
+        batch_data = batch.model_dump(mode="json")
+        write_json(part_paths["batch"], batch_data)
+        batch_parts.append(
+            {
+                "part": part_number,
+                "batch_path": str(part_paths["batch"]),
+                "batch_input_path": str(batch_input_path),
+                "batch_id": batch.id,
+                "uploaded_file_id": uploaded_file.id,
+            }
+        )
+        print(f"Part {part_number}/{total_parts} uploaded file: {uploaded_file.id}")
+        print(f"Part {part_number}/{total_parts} created batch: {batch.id}")
+
+    if part_inputs and "_part" in part_inputs[0].name:
+        for part in batch_parts:
+            existing_parts_by_number[int(part["part"])] = part
+        combined_parts = [
+            existing_parts_by_number[part_number]
+            for part_number in sorted(existing_parts_by_number)
+        ]
+        write_json(
+            paths["batch"],
+            {
+                "multi_batch": True,
+                "parts": combined_parts,
+                "max_requests_per_batch": MAX_REQUESTS_PER_BATCH,
+            },
+        )
+        print(f"Wrote combined batch metadata: {paths['batch']}")
+    else:
+        print(f"Wrote batch metadata: {paths['batch']}")
 
 
 def download_file(client: OpenAI, file_id: str, output_path: Path) -> None:
@@ -227,24 +388,64 @@ def retrieve_batch(args: argparse.Namespace) -> None:
     if not paths["batch"].exists():
         raise SystemExit(f"Missing batch metadata: {paths['batch']}. Run submit first.")
 
-    batch_id = read_json(paths["batch"])["id"]
+    batch_metadata = read_json(paths["batch"])
     client = OpenAI()
-    batch = client.batches.retrieve(batch_id)
 
-    write_json(paths["batch"], batch.model_dump(mode="json"))
-    print(f"Batch status: {batch.status}")
+    if not batch_metadata.get("multi_batch"):
+        batch_id = batch_metadata["id"]
+        batch = client.batches.retrieve(batch_id)
 
-    if batch.output_file_id:
-        download_file(client, batch.output_file_id, paths["batch_output"])
-        print(f"Wrote output: {paths['batch_output']}")
-    else:
-        print("No output_file_id yet.")
+        write_json(paths["batch"], batch.model_dump(mode="json"))
+        print(f"Batch status: {batch.status}")
 
-    if batch.error_file_id:
-        download_file(client, batch.error_file_id, paths["batch_errors"])
-        print(f"Wrote errors: {paths['batch_errors']}")
-    else:
-        print("No error_file_id.")
+        if batch.output_file_id:
+            download_file(client, batch.output_file_id, paths["batch_output"])
+            print(f"Wrote output: {paths['batch_output']}")
+        else:
+            print("No output_file_id yet.")
+
+        if batch.error_file_id:
+            download_file(client, batch.error_file_id, paths["batch_errors"])
+            print(f"Wrote errors: {paths['batch_errors']}")
+        else:
+            print("No error_file_id.")
+        return
+
+    combined_output_rows: list[dict[str, Any]] = []
+    combined_error_rows: list[dict[str, Any]] = []
+    updated_parts: list[dict[str, Any]] = []
+
+    for part in batch_metadata["parts"]:
+        part_number = int(part["part"])
+        part_paths = part_output_paths(args, part_number)
+        batch = client.batches.retrieve(part["batch_id"])
+        write_json(part_paths["batch"], batch.model_dump(mode="json"))
+        updated_part = dict(part)
+        updated_part["status"] = batch.status
+        updated_parts.append(updated_part)
+        print(f"Part {part_number}/{len(batch_metadata['parts'])} status: {batch.status}")
+
+        if batch.output_file_id:
+            download_file(client, batch.output_file_id, part_paths["batch_output"])
+            combined_output_rows.extend(read_jsonl(part_paths["batch_output"]))
+            print(f"Wrote output: {part_paths['batch_output']}")
+        else:
+            print(f"Part {part_number} has no output_file_id yet.")
+
+        if batch.error_file_id:
+            download_file(client, batch.error_file_id, part_paths["batch_errors"])
+            combined_error_rows.extend(read_jsonl(part_paths["batch_errors"]))
+            print(f"Wrote errors: {part_paths['batch_errors']}")
+
+    batch_metadata["parts"] = updated_parts
+    write_json(paths["batch"], batch_metadata)
+
+    if combined_output_rows:
+        write_jsonl(paths["batch_output"], combined_output_rows)
+        print(f"Wrote combined output: {paths['batch_output']}")
+    if combined_error_rows:
+        write_jsonl(paths["batch_errors"], combined_error_rows)
+        print(f"Wrote combined errors: {paths['batch_errors']}")
 
 
 def main() -> None:
