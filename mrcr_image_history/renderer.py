@@ -60,8 +60,14 @@ class RenderedConversationImage:
 class ConversationImageRenderer:
     """Render conversation history into compact readable images."""
 
-    def __init__(self, config: ConversationImageRendererConfig | None = None):
+    def __init__(
+        self,
+        config: ConversationImageRendererConfig | None = None,
+        *,
+        highres_config: ConversationImageRendererConfig | None = None,
+    ):
         self.config = config or ConversationImageRendererConfig()
+        self.highres_config = highres_config
         self._validate_config()
         self.font = self._load_font(self.config.font_size)
         self.char_width, self.line_height = self._font_metrics(self.font)
@@ -73,6 +79,7 @@ class ConversationImageRenderer:
         *,
         prefix: str = "conversation",
         clear_output: bool = True,
+        highres_message_numbers: set[int] | None = None,
     ) -> list[Path]:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -81,7 +88,10 @@ class ConversationImageRenderer:
             for old_image in output_dir.glob(f"{prefix}_*.png"):
                 old_image.unlink()
 
-        images = self.render_images(conversation)
+        images = self.render_images(
+            conversation,
+            highres_message_numbers=highres_message_numbers,
+        )
         digits = len(str(max(1, len(images))))
         saved_paths: list[Path] = []
 
@@ -92,18 +102,49 @@ class ConversationImageRenderer:
 
         return saved_paths
 
-    def render_base64_pages(self, conversation: list[Any]) -> list[str]:
-        return [image.base64 for image in self.render_images(conversation)]
+    def render_base64_pages(
+        self,
+        conversation: list[Any],
+        *,
+        highres_message_numbers: set[int] | None = None,
+    ) -> list[str]:
+        return [
+            image.base64
+            for image in self.render_images(
+                conversation,
+                highres_message_numbers=highres_message_numbers,
+            )
+        ]
 
-    def render_data_urls(self, conversation: list[Any]) -> list[str]:
-        return [image.data_url for image in self.render_images(conversation)]
+    def render_data_urls(
+        self,
+        conversation: list[Any],
+        *,
+        highres_message_numbers: set[int] | None = None,
+    ) -> list[str]:
+        return [
+            image.data_url
+            for image in self.render_images(
+                conversation,
+                highres_message_numbers=highres_message_numbers,
+            )
+        ]
 
-    def render_images(self, conversation: list[Any]) -> list[RenderedConversationImage]:
+    def render_images(
+        self,
+        conversation: list[Any],
+        *,
+        highres_message_numbers: set[int] | None = None,
+    ) -> list[RenderedConversationImage]:
         pages = self._paginate(conversation)
         rendered: list[RenderedConversationImage] = []
+        priority_numbers = highres_message_numbers or set()
 
         for page_index, page in enumerate(pages, 1):
-            image = self._draw_page(page)
+            if self.highres_config and self._page_has_priority_message(page, priority_numbers):
+                image = self._draw_highres_page(page)
+            else:
+                image = self._draw_page(page)
             buffer = BytesIO()
             image.save(buffer, format=self.config.image_format)
             rendered.append(
@@ -123,6 +164,32 @@ class ConversationImageRenderer:
             raise ValueError("min_height must be positive")
         if self.config.min_height > self.config.max_height:
             raise ValueError("min_height cannot be greater than max_height")
+        if self.highres_config:
+            if self.highres_config.width <= 0 or self.highres_config.max_height <= 0:
+                raise ValueError("highres width and max_height must be positive")
+            if self.highres_config.min_height <= 0:
+                raise ValueError("highres min_height must be positive")
+            if self.highres_config.min_height > self.highres_config.max_height:
+                raise ValueError("highres min_height cannot be greater than max_height")
+
+    def _page_has_priority_message(
+        self,
+        page: list[tuple[int, list[str], int]],
+        priority_numbers: set[int],
+    ) -> bool:
+        return any(number in priority_numbers for number, _, _ in page)
+
+    def _draw_highres_page(self, page: list[tuple[int, list[str], int]]) -> Image.Image:
+        if not self.highres_config:
+            return self._draw_page(page)
+
+        scale = self.highres_config.width / self.config.width
+        scaled_page = [
+            (number, lines, max(self.highres_config.margin, round(y * scale)))
+            for number, lines, y in page
+        ]
+        renderer = ConversationImageRenderer(self.highres_config)
+        return renderer._draw_page(scaled_page)
 
     def _paginate(self, conversation: list[Any]) -> list[list[tuple[int, list[str], int]]]:
         probe = Image.new("RGB", (self.config.width, 1), color=self.config.background)

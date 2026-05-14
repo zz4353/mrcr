@@ -1,34 +1,72 @@
+import base64
 import json
+import sys
 from pathlib import Path
+from typing import Any
 
-from mrcr_image_history.search import content_to_text, join_role_text
-from mrcr_image_history.search2 import search_related_turns
-
-
-def preview(text: str, limit: int = 240) -> str:
-    text = " ".join(text.split())
-    return text if len(text) <= limit else text[: limit - 3] + "..."
+from mrcr_image_history import build_image_history_messages
 
 
-row = json.loads(Path("data/mini/val.jsonl").read_text(encoding="utf-8").splitlines()[1])
-messages = row["messages"]
-active_user = content_to_text(messages[-1].get("content", ""))
-related = search_related_turns(messages, active_user, top_k=5)
+DATA_PATH = Path("data/mini/val.jsonl")
+OUTPUT_TXT = Path("runs/t_image_history_output.txt")
+IMAGE_DIR = Path("runs/t_image_history_images")
 
-print(f"user_input: {active_user}")
-print(f"expected desired_msg_index: {row.get('desired_msg_index')}")
-print(f"answer_prefix: {preview(row.get('answer', ''), 160)}")
-print()
 
-for rank, item in enumerate(related, 1):
-    user_text = join_role_text(item.turn.messages, role="user")
-    assistant_text = join_role_text(item.turn.messages, role_not="user")
-    print(
-        f"#{rank} score={item.score:.3f} "
-        f"turn={item.turn.turn_index} "
-        f"messages={item.turn.start_message_index + 1}-{item.turn.end_message_index + 1} "
-        f"reasons={', '.join(item.reasons)}"
+def image_blocks(value: Any):
+    if isinstance(value, dict):
+        if value.get("type") == "image_url":
+            image_url = value.get("image_url")
+            if isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
+                yield image_url["url"]
+        for item in value.values():
+            yield from image_blocks(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from image_blocks(item)
+
+
+def write_images(data_urls: list[str], output_dir: Path) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for old_image in output_dir.glob("*.png"):
+        old_image.unlink()
+
+    paths: list[Path] = []
+    digits = len(str(max(1, len(data_urls))))
+    for index, data_url in enumerate(data_urls, 1):
+        if "," not in data_url:
+            continue
+        _, encoded = data_url.split(",", 1)
+        image_bytes = base64.b64decode(encoded)
+        path = output_dir / f"page_{index:0{digits}d}.png"
+        path.write_bytes(image_bytes)
+        paths.append(path)
+    return paths
+
+
+def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+
+    row = json.loads(DATA_PATH.read_text(encoding="utf-8").splitlines()[0])
+    messages = build_image_history_messages(
+        row["messages"],
+        recent_turns=3,
+        highres_related_top_k=3,
     )
-    print(f"user: {preview(user_text)}")
-    print(f"assistant: {preview(assistant_text, 320)}")
-    print()
+
+    OUTPUT_TXT.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_TXT.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    data_urls = list(image_blocks(messages))
+    image_paths = write_images(data_urls, IMAGE_DIR)
+
+    print(f"input: {DATA_PATH}")
+    print(f"txt: {OUTPUT_TXT}")
+    print(f"images_dir: {IMAGE_DIR}")
+    print(f"images: {len(image_paths)}")
+    for path in image_paths:
+        print(path)
+
+
+if __name__ == "__main__":
+    main()

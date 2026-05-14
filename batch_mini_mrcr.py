@@ -48,7 +48,8 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--split", choices=("val", "test"), default="val")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--mode", choices=("text", "image-history"), default="text")
-    parser.add_argument("--recent-turns", type=int, default=3)
+    parser.add_argument("--recent-turns", type=int, default=20)
+    parser.add_argument("--highres-related-top-k", type=int, default=3)
     parser.add_argument("--model", default="gpt-5.4")
     parser.add_argument(
         "--only-parts",
@@ -171,6 +172,7 @@ def build_messages(
     *,
     mode: str,
     recent_turns: int,
+    highres_related_top_k: int,
     renderer: ConversationImageRenderer | None,
 ) -> list[dict[str, Any]]:
     if mode == "text":
@@ -180,6 +182,7 @@ def build_messages(
         row["messages"],
         recent_turns=recent_turns,
         renderer=renderer,
+        highres_related_top_k=highres_related_top_k,
     )
 
 
@@ -200,6 +203,7 @@ def build_request_rows(
                 row,
                 mode=args.mode,
                 recent_turns=args.recent_turns,
+                highres_related_top_k=args.highres_related_top_k,
                 renderer=renderer,
             ),
         }
