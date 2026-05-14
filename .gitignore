@@ -4,3 +4,4 @@ runs/
 debug_first_val_image_history/
 results/
 pycache/
+__pycache__/
